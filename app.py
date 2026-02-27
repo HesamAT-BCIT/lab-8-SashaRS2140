@@ -4,12 +4,14 @@ from typing import Optional, Tuple, Union
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, Response
 from flask.typing import ResponseReturnValue
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth
 from firebase_admin.firestore import DocumentReference
+from functools import wraps
 import os
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
+WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY")
 
 # A dummy user for the login. 
 dummy_user = {
@@ -24,6 +26,27 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # 1. Grab the expected key from the environment
+        expected_key = os.environ.get("SENSOR_API_KEY")
+
+        # 2. Grab the provided key from the request headers
+        provided_key = request.headers.get("X-API-Key")
+
+        # 3. Compare them
+        if not expected_key or provided_key != expected_key:
+            return jsonify({"error": "Unauthorized: Invalid or missing API Key"}), 401
+
+        # 4. If they match, allow the route to execute normally
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+
 def get_current_user():
     """Return the currently logged-in username (or None).
 
@@ -35,17 +58,40 @@ def get_current_user():
     return session.get("username")
 
 
-def get_user_or_401():
-    """Return the current API user or an Unauthorized response."""
-    current_user = get_current_user()
-    if not current_user:
-        return jsonify({"error": "Unauthorized"}), 401
-    return current_user
+def get_user_or_401() -> Union[str, Tuple[Response, int]]:
+    """
+    Extracts the JWT from the Authorization header, verifies it,
+    and returns the user's UID. Returns a 401 response if invalid.
+    """
+    # 1. Grab the Authorization header
+    auth_header = request.headers.get("Authorization")
+
+    # 2. Check if the header exists and follows the "Bearer <token>" format
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    # 3. Extract the token string (everything after "Bearer ")
+    token = auth_header.split("Bearer ")[1]
+
+    try:
+        # 4. Verify the token with Firebase Admin SDK
+        decoded_token = auth.verify_id_token(token)
+
+        # 5. Return the user's UID (this becomes the 'username' in your routes)
+        return decoded_token["uid"]
+
+    except auth.InvalidIdTokenError:
+        return jsonify({"error": "Invalid token"}), 401
+    except auth.ExpiredIdTokenError:
+        return jsonify({"error": "Token has expired"}), 401
+    except Exception as e:
+        # Catch any other unexpected verification errors
+        return jsonify({"error": "Authentication failed"}), 401
 
 
 def get_profile_doc_ref(username: str):
     """Get the Firestore document reference for a user's profile."""
-    return db.collection("profiles").document(username)
+    return db.collection("users_2").document(username)
 
 
 def get_profile_data(username: str):
@@ -88,6 +134,7 @@ def set_profile(username: str, profile_data: dict[str, str], *, merge: bool):
     get_profile_doc_ref(username).set(profile_data, merge=merge)
 
 # --- Web Routes ---
+
 
 @app.route("/")
 def home():
@@ -146,6 +193,41 @@ def profile():
     set_profile(current_user, normalized, merge=False)
     return redirect(url_for("home"))
 
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return render_template("signup.html")
+
+    email = request.form.get("email")
+    password = request.form.get("password")
+    confirm_password = request.form.get("confirm_password")
+
+    # Validate passwords match
+    if password != confirm_password:
+        return render_template("signup.html", error="Passwords do not match")
+
+    try:
+        # Create USER
+        user_record = auth.create_user( email=email, password=password)
+        # Initialize USER
+        db.collection("users_2").document(user_record.uid).set({
+            "email":email,
+            "role":"user",
+            "created_at": firestore.SERVER_TIMESTAMP
+        })
+        return redirect(url_for("login"))
+
+    except auth.EmailAlreadyExistsError:
+        # Handle the specific case where the email is already taken
+        return render_template("signup.html", error="An account with this email already exists.")
+
+    except Exception as e:
+        # Handle other errors (like a password being too weak)
+        return render_template("signup.html", error=f"Failed to create account: {str(e)}")
+
+    # TODO: Create user with Firebase Admin SDK
+    # TODO: Initialize profile in Firestore
+    # TODO: Redirect to login on success
 
 # --- API Routes ---
 
@@ -188,8 +270,9 @@ def api_create_profile():
 
 
 @app.put("/api/profile")
+@app.put("/api/profile")
 def api_update_profile():
-    """Update the current user's profile from a JSON body."""
+    """Update the current user's profile with strict validation."""
     user_or_response = get_user_or_401()
     if not isinstance(user_or_response, str):
         return user_or_response
@@ -203,28 +286,45 @@ def api_update_profile():
     if not data:
         return jsonify({"error": "Request body cannot be empty"}), 400
 
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
-    student_id = data.get("student_id")
+    # 1. Whitelist: Reject any unexpected fields
+    allowed_fields = {"first_name", "last_name", "student_id"}
+    invalid_fields = set(data.keys()) - allowed_fields
+    if invalid_fields:
+        return jsonify({"error": f"Invalid fields provided: {', '.join(invalid_fields)}"}), 400
 
-    # Prepare the update data (only include provided fields)
+    errors = []
     update_data = {}
-    if first_name is not None:
-        update_data["first_name"] = first_name.strip() if first_name else ""
-    if last_name is not None:
-        update_data["last_name"] = last_name.strip() if last_name else ""
-    if student_id is not None:
-        update_data["student_id"] = str(student_id).strip() if student_id else ""
+
+    # 2 & 3. Bounds Checking & Collecting All Errors
+    if "first_name" in data:
+        fname = str(data["first_name"]).strip()
+        if len(fname) > 50:
+            errors.append("first_name must not exceed 50 characters.")
+        update_data["first_name"] = fname
+
+    if "last_name" in data:
+        lname = str(data["last_name"]).strip()
+        if len(lname) > 50:
+            errors.append("last_name must not exceed 50 characters.")
+        update_data["last_name"] = lname
+
+    if "student_id" in data:
+        sid = str(data["student_id"]).strip()
+        if not (8 <= len(sid) <= 9) or not sid.isalnum():
+            errors.append("student_id must be exactly 8 or 9 alphanumeric characters.")
+        update_data["student_id"] = sid
+
+    # If any errors were collected, return them all at once
+    if errors:
+        return jsonify({"errors": errors}), 400
 
     if not update_data:
         return jsonify({"error": "No updatable fields provided"}), 400
 
-    # Merge update into existing document (or create if missing).
     set_profile(username, update_data, merge=True)
-
     updated_profile = get_profile_data(username)
-    return jsonify({"message": "Profile updated successfully", "profile": updated_profile}), 200
 
+    return jsonify({"message": "Profile updated successfully", "profile": updated_profile}), 200
 
 @app.delete("/api/profile")
 def api_delete_profile():
@@ -237,6 +337,53 @@ def api_delete_profile():
     get_profile_doc_ref(username).delete()
     return jsonify({"message": "Profile deleted successfully"}), 200
 
+@app.route("/api/signup", methods=["POST"])
+def api_signup():
+    """Create a new user and initialize their profile via API (JSON)."""
+    # Ensure the client sent JSON data
+    content_error = require_json_content_type()
+    if content_error:
+        return content_error
+
+    data = request.get_json(silent=True) or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    # Basic validation
+    if not email or not password:
+        return jsonify({"error": "Email and password are required."}), 400
+
+    try:
+        # Step 1: Create the identity in Firebase Auth
+        user_record = auth.create_user(
+            email=email,
+            password=password
+        )
+
+        # Step 2: Initialize their profile in Firestore using the generated UID
+        db.collection("users_2").document(user_record.uid).set({
+            "email": email,
+            "role": "user",
+            "created_at": firestore.SERVER_TIMESTAMP
+        })
+
+        # Return a success response with a 201 Created status code
+        return jsonify({"message": "User successfully created", "uid": user_record.uid}), 201
+
+    except auth.EmailAlreadyExistsError:
+        return jsonify({"error": "An account with this email already exists."}), 409
+    except Exception as e:
+        return jsonify({"error": f"Failed to create account: {str(e)}"}), 500
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={WEB_API_KEY}"
+    payload = {"email": data["email"], "password": data["password"], "returnSecureToken": True}
+
+    res = requests.post(url, json=payload)
+    if res.status_code == 200:
+        return jsonify({"token": res.json()["idToken"]}), 200
+    return jsonify({"error": "Invalid credentials"}), 401
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
